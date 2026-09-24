@@ -24,6 +24,7 @@ use sotto_cli::prompts;
 use sotto_cli::remote;
 use sotto_cli::session;
 use sotto_cli::store::Store;
+use sotto_cli::tui;
 use sotto_cli::vault::Vault;
 
 /// How long an unlocked session lasts before the master password is needed again.
@@ -48,7 +49,7 @@ struct Cli {
     #[arg(long, global = true)]
     plain: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -360,32 +361,32 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Command::Share {
+        Some(Command::Share {
             copy: true,
             no_copy: true,
             ..
-        } => {
+        }) => {
             return Err(Error::Input("--copy conflicts with --no-copy".into()));
         }
-        Command::Get {
+        Some(Command::Get {
             copy: true,
             reveal: true,
             ..
-        } => {
+        }) => {
             return Err(Error::Input("--copy conflicts with --reveal".into()));
         }
-        Command::Get {
+        Some(Command::Get {
             copy: true,
             no_copy: true,
             ..
-        } => {
+        }) => {
             return Err(Error::Input("--copy conflicts with --no-copy".into()));
         }
         _ => {}
     }
 
     // Completions need neither the store nor the keychain - handle before touching either.
-    if let Command::Completions { shell } = &cli.command {
+    if let Some(Command::Completions { shell }) = &cli.command {
         clap_complete::generate(*shell, &mut Cli::command(), "sotto", &mut io::stdout());
         return Ok(());
     }
@@ -395,8 +396,10 @@ fn run() -> Result<()> {
     // resolution: machine output is never styled and must not depend on the config file.
     if let Ok(token) = std::env::var("SOTTO_TOKEN") {
         match &cli.command {
-            Command::Run { args } => return machine_run(&token, args.clone()),
-            Command::Export { format, reveal } => return machine_export(&token, *format, *reveal),
+            Some(Command::Run { args }) => return machine_run(&token, args.clone()),
+            Some(Command::Export { format, reveal }) => {
+                return machine_export(&token, *format, *reveal)
+            }
             _ => {} // every other command proceeds as a normal session
         }
     }
@@ -437,10 +440,19 @@ fn run() -> Result<()> {
     }
 
     // Theme commands need neither the store nor the keychain.
-    if let Command::Theme { command } = &cli.command {
+    if let Some(Command::Theme { command }) = &cli.command {
         let config_path = sotto_cli::paths::config_path()?;
         let themes_dir = sotto_cli::paths::themes_path()?;
         return theme_command(command.as_ref(), &theme, &config_path, &themes_dir);
+    }
+
+    // Bare sotto in a non-interactive environment prints help to stderr and exits 2,
+    // without creating the data directory or opening the store.
+    if cli.command.is_none() && !prompts::can_prompt() {
+        let mut cmd = Cli::command();
+        let _ = cmd.write_help(&mut std::io::stderr());
+        eprintln!();
+        std::process::exit(2);
     }
 
     let store_path = sotto_cli::paths::store_path()?;
@@ -453,7 +465,16 @@ fn run() -> Result<()> {
     let app = App::new(&store, &keychain);
     let cwd = std::env::current_dir().map_err(|e| Error::Io(e.to_string()))?;
 
-    match cli.command {
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        None => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            ensure_unlocked(&store, &keychain)?;
+            return tui::run(&app, &store, &config, &theme);
+        }
+    };
+
+    match command {
         Command::Init { name, org } => init(&store, &keychain, &cwd, name, org),
         Command::Org { command } => org_command(&store, &keychain, command),
         Command::Grant { user_id } => {
@@ -1600,11 +1621,11 @@ fn env_list_json(environments: &[String], active: &str) -> Result<String> {
 }
 
 fn ensure_unlocked(store: &Store, keychain: &dyn Keychain) -> Result<()> {
-    if session::current_master_key(keychain)?.is_some() {
-        return Ok(());
-    }
     if store.get_identity()?.is_none() {
         return Err(Error::NoIdentity);
+    }
+    if session::current_master_key(keychain)?.is_some() {
+        return Ok(());
     }
     let mut password = read_password("Master password: ")?;
     let _spinner = sotto_cli::feedback::spinner("Deriving key...");
@@ -1949,10 +1970,10 @@ mod tests {
                 .unwrap_or_else(|err| panic!("version {version} should parse: {err}"));
             assert!(matches!(
                 cli.command,
-                Command::Rollback {
+                Some(Command::Rollback {
                     version: parsed,
                     ..
-                } if parsed == version
+                }) if parsed == version
             ));
         }
 
@@ -1981,7 +2002,7 @@ mod tests {
         let cli = Cli::try_parse_from(["sotto", "run", "--", "npm", "start"])
             .expect("npm example should parse");
         assert!(cli.env.is_none());
-        let Command::Run { args } = cli.command else {
+        let Some(Command::Run { args }) = cli.command else {
             panic!("expected run command");
         };
         assert_eq!(args, vec!["npm".to_owned(), "start".to_owned()]);
@@ -1989,14 +2010,14 @@ mod tests {
         let cli = Cli::try_parse_from(["sotto", "run", "--env", "staging", "--", "npm", "test"])
             .expect("environment example should parse");
         assert_eq!(cli.env.as_deref(), Some("staging"));
-        let Command::Run { args } = cli.command else {
+        let Some(Command::Run { args }) = cli.command else {
             panic!("expected run command");
         };
         assert_eq!(args, vec!["npm".to_owned(), "test".to_owned()]);
 
         let cli = Cli::try_parse_from(["sotto", "run", "--", "python", "-c", "print('hello')"])
             .expect("python example should parse");
-        let Command::Run { args } = cli.command else {
+        let Some(Command::Run { args }) = cli.command else {
             panic!("expected run command");
         };
         assert_eq!(
@@ -2047,14 +2068,14 @@ mod tests {
         let cli = Cli::try_parse_from(["sotto", "theme", "ls"]).expect("theme ls should parse");
         assert!(matches!(
             cli.command,
-            Command::Theme {
+            Some(Command::Theme {
                 command: Some(ThemeCommand::Ls)
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["sotto", "theme", "set", "sordino"])
             .expect("theme set should parse");
-        let Command::Theme { command } = cli.command else {
+        let Some(Command::Theme { command }) = cli.command else {
             panic!("expected theme command");
         };
         assert!(matches!(command, Some(ThemeCommand::Set { name }) if name == "sordino"));
@@ -2063,14 +2084,17 @@ mod tests {
             Cli::try_parse_from(["sotto", "theme", "current"]).expect("theme current should parse");
         assert!(matches!(
             cli.command,
-            Command::Theme {
+            Some(Command::Theme {
                 command: Some(ThemeCommand::Current)
-            }
+            })
         ));
 
         // Bare `sotto theme` defaults to listing.
         let cli = Cli::try_parse_from(["sotto", "theme"]).expect("bare theme should parse");
-        assert!(matches!(cli.command, Command::Theme { command: None }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Theme { command: None })
+        ));
     }
 
     #[test]
@@ -2128,30 +2152,30 @@ mod tests {
         let cli = Cli::try_parse_from(["sotto", "get", "KEY", "-c"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Get {
+            Some(Command::Get {
                 copy: true,
                 reveal: false,
                 ..
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--copy"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Share {
+            Some(Command::Share {
                 copy: true,
                 no_copy: false,
                 ..
-            }
+            })
         ));
         let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--no-copy"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Share {
+            Some(Command::Share {
                 copy: false,
                 no_copy: true,
                 ..
-            }
+            })
         ));
     }
 
@@ -2160,13 +2184,15 @@ mod tests {
         for views in [1, sotto_cli::remote::share::MAX_VIEWS] {
             let value = views.to_string();
             let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--views", &value]).unwrap();
-            assert!(matches!(cli.command, Command::Share { views: parsed, .. } if parsed == views));
+            assert!(
+                matches!(cli.command, Some(Command::Share { views: parsed, .. }) if parsed == views)
+            );
         }
         for expire in [1, sotto_cli::remote::share::MAX_TTL_SECONDS] {
             let value = expire.to_string();
             let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--expire", &value]).unwrap();
             assert!(
-                matches!(cli.command, Command::Share { expire: Some(parsed), .. } if parsed == expire)
+                matches!(cli.command, Some(Command::Share { expire: Some(parsed), .. }) if parsed == expire)
             );
         }
 
@@ -2184,11 +2210,11 @@ mod tests {
         let cli = Cli::try_parse_from(["sotto", "share", "KEY"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Share {
+            Some(Command::Share {
                 views: 1,
                 expire: None,
                 ..
-            }
+            })
         ));
     }
 
@@ -2277,18 +2303,18 @@ mod tests {
     fn env_ls_json_parser_parses_flag() {
         let cli = Cli::try_parse_from(["sotto", "env", "ls", "--json"])
             .expect("sotto env ls --json should parse");
-        let Command::Env {
+        let Some(Command::Env {
             command: EnvCommand::Ls { json },
-        } = cli.command
+        }) = cli.command
         else {
             panic!("expected EnvCommand::Ls");
         };
         assert!(json);
 
         let cli = Cli::try_parse_from(["sotto", "env", "ls"]).expect("sotto env ls should parse");
-        let Command::Env {
+        let Some(Command::Env {
             command: EnvCommand::Ls { json },
-        } = cli.command
+        }) = cli.command
         else {
             panic!("expected EnvCommand::Ls");
         };
@@ -2310,62 +2336,71 @@ mod tests {
     }
 
     #[test]
+    fn bare_sotto_parses_as_none_command() {
+        let cli = Cli::try_parse_from(["sotto"]).expect("bare sotto should parse");
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
     fn subcommands_parse_with_omitted_name_for_interactive_fallbacks() {
         let cli =
             Cli::try_parse_from(["sotto", "get"]).expect("sotto get without args should parse");
         assert!(matches!(
             cli.command,
-            Command::Get {
+            Some(Command::Get {
                 name: None,
                 no_copy: false,
                 ..
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["sotto", "get", "--no-copy"])
             .expect("sotto get --no-copy should parse");
         assert!(matches!(
             cli.command,
-            Command::Get {
+            Some(Command::Get {
                 name: None,
                 no_copy: true,
                 ..
-            }
+            })
         ));
 
         let cli =
             Cli::try_parse_from(["sotto", "reset", "-y"]).expect("sotto reset -y should parse");
-        assert!(matches!(cli.command, Command::Reset { yes: true }));
+        assert!(matches!(cli.command, Some(Command::Reset { yes: true })));
 
         let cli = Cli::try_parse_from(["sotto", "rm"]).expect("sotto rm without args should parse");
         assert!(matches!(
             cli.command,
-            Command::Rm {
+            Some(Command::Rm {
                 name: None,
                 yes: false
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["sotto", "rm", "-y"]).expect("sotto rm -y should parse");
         assert!(matches!(
             cli.command,
-            Command::Rm {
+            Some(Command::Rm {
                 name: None,
                 yes: true
-            }
+            })
         ));
 
         let cli =
             Cli::try_parse_from(["sotto", "share"]).expect("sotto share without args should parse");
-        assert!(matches!(cli.command, Command::Share { name: None, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Share { name: None, .. })
+        ));
 
         let cli = Cli::try_parse_from(["sotto", "env", "use"])
             .expect("sotto env use without args should parse");
         assert!(matches!(
             cli.command,
-            Command::Env {
+            Some(Command::Env {
                 command: EnvCommand::Use { name: None }
-            }
+            })
         ));
     }
 }
